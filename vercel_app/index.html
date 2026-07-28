@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Aura — ML Weather Predictor</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+    rel="stylesheet"
+  />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <!-- soft animated aurora background -->
+  <div class="aurora">
+    <span class="blob b1"></span>
+    <span class="blob b2"></span>
+    <span class="blob b3"></span>
+  </div>
+
+  <main class="wrap">
+    <!-- ---------- header + search ---------- -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">◑</div>
+        <div>
+          <h1>Aura</h1>
+          <p class="tag">A weather forecast our own model actually predicts</p>
+        </div>
+      </div>
+
+      <form id="search" class="search" autocomplete="off">
+        <span class="search-icon">⌕</span>
+        <input id="city" type="text" placeholder="Search any city…" aria-label="City" />
+        <button type="submit" id="go">Predict</button>
+      </form>
+    </header>
+
+    <div class="chips" id="chips">
+      <button data-city="Mumbai">Mumbai</button>
+      <button data-city="Delhi">Delhi</button>
+      <button data-city="Bengaluru">Bengaluru</button>
+      <button data-city="London">London</button>
+      <button data-city="Tokyo">Tokyo</button>
+      <button data-city="New York">New York</button>
+    </div>
+
+    <!-- ---------- states ---------- -->
+    <div id="loader" class="loader hidden">
+      <div class="spinner"></div>
+      <p id="loader-text">Downloading history &amp; training the model…</p>
+    </div>
+
+    <div id="error" class="error hidden"></div>
+
+    <!-- ---------- results ---------- -->
+    <section id="results" class="results hidden">
+      <!-- current conditions hero -->
+      <div class="glass hero">
+        <div class="hero-main">
+          <div class="hero-emoji" id="cur-emoji">☀️</div>
+          <div>
+            <div class="hero-temp"><span id="cur-temp">—</span><span class="deg">°</span></div>
+            <div class="hero-desc" id="cur-desc">—</div>
+          </div>
+        </div>
+        <div class="hero-side">
+          <div class="place" id="cur-place">—</div>
+          <div class="hero-stats">
+            <div><span class="k">Feels like</span><span class="v" id="cur-feels">—</span></div>
+            <div><span class="k">Humidity</span><span class="v" id="cur-hum">—</span></div>
+            <div><span class="k">Wind</span><span class="v" id="cur-wind">—</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- our model's 7-day forecast -->
+      <div class="section-head">
+        <h2>Our model’s 7-day forecast</h2>
+        <span class="badge" id="src-badge">home-grown ML</span>
+      </div>
+      <div class="forecast-row" id="forecast"></div>
+
+      <!-- chart: our model vs the professionals -->
+      <div class="glass panel">
+        <div class="panel-head">
+          <h3>Our prediction vs. the professional forecast</h3>
+          <p>Recent real temperatures on the left; from today onward, our model’s daily high
+             (solid) next to Open-Meteo’s pro forecast (dashed). Closer lines = our model agrees
+             with the pros.</p>
+        </div>
+        <div class="chart-box"><canvas id="chart"></canvas></div>
+      </div>
+
+      <!-- model quality report -->
+      <div class="glass panel">
+        <div class="panel-head">
+          <h3>How good is this model?</h3>
+          <p>Measured honestly on recent data the model never saw during training.</p>
+        </div>
+        <div class="metrics" id="metrics"></div>
+      </div>
+    </section>
+
+    <footer class="foot">
+      Data: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (free, no key)
+      · Model: Analog forecasting (k-NN) · Built for a college project
+    </footer>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

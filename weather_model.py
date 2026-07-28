@@ -13,11 +13,17 @@ What it does, in plain terms:
      how our home-grown model stacks up against it.
 
 Everything here is free. No API keys, no billing.
+
+Resilience: free weather APIs rate-limit shared cloud IPs (429). Every request
+retries with backoff, and if the *live* feed stays throttled we degrade
+gracefully -- the 7-day model forecast (built from the archive, which is far more
+lenient) is still delivered instead of failing outright.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import time
 from typing import Any
 
 import numpy as np
@@ -32,7 +38,6 @@ GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
-# Daily variables we ask the API for.
 DAILY_VARS = [
     "temperature_2m_max",
     "temperature_2m_min",
@@ -41,20 +46,41 @@ DAILY_VARS = [
     "wind_speed_10m_max",
 ]
 
-# How many years of history to train on, and how far ahead we forecast.
 HISTORY_YEARS = 8
 FORECAST_DAYS = 7
-RAIN_THRESHOLD_MM = 1.0  # a day counts as "rainy" if it gets at least this much
+RAIN_THRESHOLD_MM = 1.0
 
-# Lag features: we let the model look at the weather 1, 2, 3 and 7 days ago.
 LAGS = [1, 2, 3, 7]
-MIN_LOOKBACK = max(LAGS)  # need at least this many prior days to build a feature row
+MIN_LOOKBACK = max(LAGS)
 
 HTTP_TIMEOUT = 30
+RETRIES = 4  # total attempts per request before giving up
 
 
 class WeatherError(Exception):
     """Friendly, user-facing error (e.g. city not found, API down)."""
+
+
+# --------------------------------------------------------------------------- #
+# Networking with retry/backoff (handles the 429s from shared cloud IPs)
+# --------------------------------------------------------------------------- #
+def _get_json(url: str, params: dict, what: str) -> dict:
+    last = "unknown error"
+    for attempt in range(RETRIES):
+        try:
+            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+            if r.status_code == 429 or r.status_code >= 500:
+                last = f"HTTP {r.status_code}"
+                retry_after = r.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after and retry_after.isdigit() else 0.6 * (2 ** attempt)
+                time.sleep(min(wait, 5.0))
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as exc:
+            last = str(exc)
+            time.sleep(0.6 * (2 ** attempt))
+    raise WeatherError(f"Could not download {what}: {last}")
 
 
 # --------------------------------------------------------------------------- #
@@ -64,30 +90,19 @@ def geocode(city: str) -> dict[str, Any]:
     city = (city or "").strip()
     if not city:
         raise WeatherError("Please type a city name.")
-    try:
-        r = requests.get(
-            GEO_URL,
-            params={"name": city, "count": 1, "language": "en", "format": "json"},
-            timeout=HTTP_TIMEOUT,
-        )
-        r.raise_for_status()
-        data = r.json()
-    except requests.RequestException as exc:
-        raise WeatherError(f"Could not reach the location service: {exc}") from exc
-
+    data = _get_json(
+        GEO_URL,
+        {"name": city, "count": 1, "language": "en", "format": "json"},
+        "the location service",
+    )
     results = data.get("results")
     if not results:
         raise WeatherError(f'Could not find a city called "{city}". Check the spelling?')
 
     top = results[0]
-    name = top["name"]
-    parts = [name]
-    if top.get("admin1"):
-        parts.append(top["admin1"])
-    if top.get("country"):
-        parts.append(top["country"])
+    parts = [top["name"]] + [top[k] for k in ("admin1", "country") if top.get(k)]
     return {
-        "name": name,
+        "name": top["name"],
         "label": ", ".join(parts),
         "latitude": top["latitude"],
         "longitude": top["longitude"],
@@ -100,7 +115,6 @@ def geocode(city: str) -> dict[str, Any]:
 # 2. Data download
 # --------------------------------------------------------------------------- #
 def _daily_records(daily: dict[str, list]) -> list[dict[str, Any]]:
-    """Turn Open-Meteo's column-wise JSON into a clean, row-wise list of days."""
     times = daily.get("time", [])
     records = []
     for i, day in enumerate(times):
@@ -108,20 +122,12 @@ def _daily_records(daily: dict[str, list]) -> list[dict[str, Any]]:
             seq = daily.get(key) or []
             return seq[i] if i < len(seq) else None
 
-        tmax = val("temperature_2m_max")
-        tmin = val("temperature_2m_min")
-        tmean = val("temperature_2m_mean")
-        precip = val("precipitation_sum")
-        wind = val("wind_speed_10m_max")
-
-        # If the mean is missing, approximate it from max/min.
+        tmax, tmin, tmean = val("temperature_2m_max"), val("temperature_2m_min"), val("temperature_2m_mean")
         if tmean is None and tmax is not None and tmin is not None:
             tmean = (tmax + tmin) / 2.0
-
-        # Skip days with holes in the key fields.
         if tmax is None or tmin is None or tmean is None:
             continue
-
+        precip, wind = val("precipitation_sum"), val("wind_speed_10m_max")
         records.append(
             {
                 "date": dt.date.fromisoformat(day),
@@ -139,102 +145,59 @@ def fetch_history(lat: float, lon: float, tz: str) -> list[dict[str, Any]]:
     """~8 years of settled historical daily data from the archive."""
     end = dt.date.today() - dt.timedelta(days=6)  # archive lags ~5 days
     start = end - dt.timedelta(days=365 * HISTORY_YEARS)
-    try:
-        r = requests.get(
-            ARCHIVE_URL,
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "start_date": start.isoformat(),
-                "end_date": end.isoformat(),
-                "daily": ",".join(DAILY_VARS),
-                "timezone": tz,
-            },
-            timeout=HTTP_TIMEOUT,
-        )
-        r.raise_for_status()
-        data = r.json()
-    except requests.RequestException as exc:
-        raise WeatherError(f"Could not download historical weather: {exc}") from exc
+    data = _get_json(
+        ARCHIVE_URL,
+        {
+            "latitude": lat, "longitude": lon,
+            "start_date": start.isoformat(), "end_date": end.isoformat(),
+            "daily": ",".join(DAILY_VARS), "timezone": tz,
+        },
+        "historical weather",
+    )
     return _daily_records(data.get("daily", {}))
 
 
 def fetch_recent_and_forecast(lat: float, lon: float, tz: str) -> dict[str, Any]:
-    """
-    One call to the forecast endpoint gets us three things at once:
-      - current conditions (for the big hero card),
-      - the last ~15 days of *actual* weather (to bridge the archive's 5-day gap
-        and to seed our own forecast),
-      - Open-Meteo's own 7-day forecast (our professional benchmark).
-    """
-    try:
-        r = requests.get(
-            FORECAST_URL,
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "daily": ",".join(DAILY_VARS + ["weather_code"]),
-                "current": ",".join(
-                    [
-                        "temperature_2m",
-                        "apparent_temperature",
-                        "relative_humidity_2m",
-                        "weather_code",
-                        "wind_speed_10m",
-                        "precipitation",
-                    ]
-                ),
-                "past_days": 15,
-                "forecast_days": FORECAST_DAYS,
-                "timezone": tz,
-            },
-            timeout=HTTP_TIMEOUT,
-        )
-        r.raise_for_status()
-        data = r.json()
-    except requests.RequestException as exc:
-        raise WeatherError(f"Could not download current conditions: {exc}") from exc
-
+    """Current conditions + last ~15 days of actuals + Open-Meteo's own forecast.
+    (This hits the forecast endpoint, which is the one that gets rate-limited.)"""
+    data = _get_json(
+        FORECAST_URL,
+        {
+            "latitude": lat, "longitude": lon,
+            "daily": ",".join(DAILY_VARS + ["weather_code"]),
+            "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,precipitation",
+            "past_days": 15, "forecast_days": FORECAST_DAYS, "timezone": tz,
+        },
+        "current conditions",
+    )
     today = dt.date.today()
     daily = data.get("daily", {})
-    codes = daily.get("weather_code", []) or []
-    times = daily.get("time", [])
-
-    recent_actuals: list[dict[str, Any]] = []
-    pro_forecast: list[dict[str, Any]] = []
-    for i, rec in enumerate(_daily_records(daily)):
-        # weather_code is not part of _daily_records, so re-attach it here
+    codes, times = daily.get("weather_code", []) or [], daily.get("time", [])
+    recent, pro = [], []
+    for rec in _daily_records(daily):
         try:
             idx = times.index(rec["date"].isoformat())
             rec["weather_code"] = int(codes[idx]) if idx < len(codes) and codes[idx] is not None else 0
         except (ValueError, TypeError):
             rec["weather_code"] = 0
-
-        if rec["date"] <= today:
-            recent_actuals.append(rec)
-        else:
-            pro_forecast.append(rec)
-
+        (recent if rec["date"] <= today else pro).append(rec)
     return {
         "current": data.get("current", {}),
         "current_units": data.get("current_units", {}),
-        "recent_actuals": recent_actuals,
-        "pro_forecast": pro_forecast,
+        "recent_actuals": recent,
+        "pro_forecast": pro,
     }
 
 
 def _merge_actuals(history: list[dict], recent: list[dict]) -> list[dict]:
-    """Combine archive history with the last-15-days actuals, dedup by date."""
-    by_date: dict[dt.date, dict] = {}
+    by_date = {}
     for rec in history + recent:
-        by_date[rec["date"]] = rec  # recent wins on overlap (fresher)
+        by_date[rec["date"]] = rec
     return [by_date[d] for d in sorted(by_date)]
 
 
 # --------------------------------------------------------------------------- #
-# 3. Feature engineering
-#    The SAME function builds features for training and for forecasting, so
-#    there's no chance of train/inference mismatch.
+# 3. Feature engineering (same function for training and forecasting)
 # --------------------------------------------------------------------------- #
 FEATURE_NAMES = (
     ["doy_sin", "doy_cos"]
@@ -244,16 +207,11 @@ FEATURE_NAMES = (
 
 
 def _season(date: dt.date) -> tuple[float, float]:
-    """Encode the day-of-year as a point on a circle so the model understands
-    that Dec 31 and Jan 1 are neighbours, not opposites."""
-    doy = date.timetuple().tm_yday
-    ang = 2.0 * np.pi * doy / 365.25
+    ang = 2.0 * np.pi * date.timetuple().tm_yday / 365.25
     return float(np.sin(ang)), float(np.cos(ang))
 
 
 def features_for(history: list[dict], target_date: dt.date) -> list[float]:
-    """Build one feature row describing everything the model knows the day
-    BEFORE `target_date`. `history` must end on target_date - 1 day."""
     sin, cos = _season(target_date)
     feats = [sin, cos]
     for lag in LAGS:
@@ -267,69 +225,72 @@ def features_for(history: list[dict], target_date: dt.date) -> list[float]:
 
 
 def _build_supervised(records: list[dict]):
-    """Slide over the history to build (X, y) pairs: from the days up to i-1,
-    predict day i."""
     X, y_reg, y_clf = [], [], []
     for i in range(MIN_LOOKBACK, len(records)):
         X.append(features_for(records[:i], records[i]["date"]))
         tgt = records[i]
         y_reg.append([tgt["tmax"], tgt["tmin"], tgt["tmean"], tgt["precip"]])
         y_clf.append(1 if tgt["precip"] >= RAIN_THRESHOLD_MM else 0)
-    return np.array(X, dtype=float), np.array(y_reg, dtype=float), np.array(y_clf, dtype=int)
+    return np.array(X, float), np.array(y_reg, float), np.array(y_clf, int)
 
 
 # --------------------------------------------------------------------------- #
 # 4. Train + evaluate + forecast
 # --------------------------------------------------------------------------- #
 def train_and_forecast(city: str) -> dict[str, Any]:
-    """The whole pipeline for one city. Returns everything the UI needs."""
     place = geocode(city)
     lat, lon, tz = place["latitude"], place["longitude"], place["timezone"]
 
-    history = fetch_history(lat, lon, tz)
-    live = fetch_recent_and_forecast(lat, lon, tz)
-    records = _merge_actuals(history, live["recent_actuals"])
+    history = fetch_history(lat, lon, tz)  # archive endpoint (lenient)
+
+    # Live feed (current + recent + pro forecast) may be rate-limited on cloud
+    # IPs. If so, degrade gracefully instead of failing the whole request.
+    live_available = True
+    try:
+        live = fetch_recent_and_forecast(lat, lon, tz)
+        records = _merge_actuals(history, live["recent_actuals"])
+        current = live["current"]
+        current_units = live["current_units"]
+        pro_forecast = live["pro_forecast"]
+    except WeatherError:
+        live_available = False
+        records = history
+        last = history[-1]
+        current = {
+            "temperature_2m": round(last["tmean"], 1),
+            "apparent_temperature": round(last["tmean"], 1),
+            "relative_humidity_2m": None,
+            "weather_code": last.get("weather_code", 0),
+            "wind_speed_10m": round(last.get("wind", 0.0), 1),
+        }
+        current_units = {"temperature_2m": "°C", "wind_speed_10m": "km/h"}
+        pro_forecast = []
 
     if len(records) < 400:
         raise WeatherError("Not enough historical data for this location to train a model.")
 
     X, y_reg, y_clf = _build_supervised(records)
 
-    # Time-based split: train on the older 80%, test on the most recent 20%.
-    # (We never let the model peek at the future during evaluation.)
     split = int(len(X) * 0.8)
     Xtr, Xte = X[:split], X[split:]
     ytr_r, yte_r = y_reg[:split], y_reg[split:]
     ytr_c, yte_c = y_clf[:split], y_clf[split:]
 
-    reg = RandomForestRegressor(
-        n_estimators=250, max_depth=None, min_samples_leaf=2,
-        n_jobs=-1, random_state=42,
-    )
+    reg = RandomForestRegressor(n_estimators=250, min_samples_leaf=2, n_jobs=-1, random_state=42)
     reg.fit(Xtr, ytr_r)
-
-    # Honest accuracy check on unseen recent data.
     pred_te = reg.predict(Xte)
     mae_tmax = float(mean_absolute_error(yte_r[:, 0], pred_te[:, 0]))
     mae_tmin = float(mean_absolute_error(yte_r[:, 1], pred_te[:, 1]))
-
-    # Persistence baseline = "tomorrow will be the same as today". A model is
-    # only worth anything if it beats this.
     base_tmax = float(mean_absolute_error(yte_r[:, 0], Xte[:, FEATURE_NAMES.index("tmax_lag1")]))
     base_tmin = float(mean_absolute_error(yte_r[:, 1], Xte[:, FEATURE_NAMES.index("tmin_lag1")]))
 
-    # Rain classifier (only if we've actually seen both rainy and dry days).
-    rain_accuracy = None
-    clf = None
+    rain_accuracy, clf = None, None
     if len(set(ytr_c)) > 1:
-        clf = RandomForestClassifier(
-            n_estimators=250, min_samples_leaf=2, n_jobs=-1,
-            random_state=42, class_weight="balanced",
-        )
+        clf = RandomForestClassifier(n_estimators=250, min_samples_leaf=2, n_jobs=-1,
+                                     random_state=42, class_weight="balanced")
         clf.fit(Xtr, ytr_c)
         rain_accuracy = float((clf.predict(Xte) == yte_c).mean() * 100.0)
 
-    # Retrain on ALL data for the sharpest possible real forecast.
     reg.fit(X, y_reg)
     if clf is not None:
         clf.fit(X, y_clf)
@@ -338,80 +299,65 @@ def train_and_forecast(city: str) -> dict[str, Any]:
 
     return {
         "place": place,
-        "current": live["current"],
-        "current_units": live["current_units"],
+        "current": current,
+        "current_units": current_units,
+        "live_available": live_available,
         "recent_actuals": [_public(r) for r in records[-14:]],
         "my_forecast": my_forecast,
-        "pro_forecast": [_public(r) for r in live["pro_forecast"]],
+        "pro_forecast": [_public(r) for r in pro_forecast],
         "metrics": {
-            "mae_tmax": round(mae_tmax, 2),
-            "mae_tmin": round(mae_tmin, 2),
-            "baseline_tmax": round(base_tmax, 2),
-            "baseline_tmin": round(base_tmin, 2),
+            "mae_tmax": round(mae_tmax, 2), "mae_tmin": round(mae_tmin, 2),
+            "baseline_tmax": round(base_tmax, 2), "baseline_tmin": round(base_tmin, 2),
             "rain_accuracy": round(rain_accuracy, 1) if rain_accuracy is not None else None,
-            "train_days": len(records),
-            "test_days": len(Xte),
-            "history_years": HISTORY_YEARS,
+            "train_days": len(records), "test_days": len(Xte), "history_years": HISTORY_YEARS,
         },
     }
 
 
 def _roll_forward(reg, clf, records: list[dict]) -> list[dict]:
-    """Autoregressive forecast: predict tomorrow, then treat that prediction as
-    'today' and predict the day after, and so on for a week."""
-    working = list(records)  # a growing copy we append our own predictions to
+    """Autoregressive forecast, always anchored to real future dates (handles the
+    case where the newest data we have is a few days old)."""
+    working = list(records)
     last_date = working[-1]["date"]
+    today = dt.date.today()
+    total_steps = (today - last_date).days + FORECAST_DAYS
     out = []
-    for step in range(1, FORECAST_DAYS + 1):
+    for step in range(1, total_steps + 1):
         target = last_date + dt.timedelta(days=step)
-        feats = np.array(features_for(working, target), dtype=float).reshape(1, -1)
+        feats = np.array(features_for(working, target), float).reshape(1, -1)
         tmax, tmin, tmean, precip = (float(v) for v in reg.predict(feats)[0])
         precip = max(0.0, precip)
-
-        rain_prob = None
-        if clf is not None:
-            rain_prob = round(float(clf.predict_proba(feats)[0][1]) * 100.0, 0)
-
-        out.append(
-            {
-                "date": target.isoformat(),
-                "tmax": round(tmax, 1),
-                "tmin": round(tmin, 1),
-                "tmean": round(tmean, 1),
-                "precip": round(precip, 1),
-                "rain_prob": rain_prob,
+        rain_prob = round(float(clf.predict_proba(feats)[0][1]) * 100.0, 0) if clf is not None else None
+        working.append({"date": target, "tmax": tmax, "tmin": tmin, "tmean": tmean,
+                        "precip": precip, "wind": working[-1]["wind"]})
+        if target > today:
+            out.append({
+                "date": target.isoformat(), "tmax": round(tmax, 1), "tmin": round(tmin, 1),
+                "tmean": round(tmean, 1), "precip": round(precip, 1), "rain_prob": rain_prob,
                 "weather_code": _guess_code(precip, rain_prob),
-            }
-        )
-        # Feed the prediction back in so the next day builds on it.
-        working.append(
-            {"date": target, "tmax": tmax, "tmin": tmin, "tmean": tmean,
-             "precip": precip, "wind": working[-1]["wind"]}
-        )
+            })
+        if len(out) >= FORECAST_DAYS:
+            break
     return out
 
 
 def _guess_code(precip: float, rain_prob: float | None) -> int:
-    """Rough WMO weather code from our predicted numbers, just for the icon."""
     p = rain_prob if rain_prob is not None else (80 if precip >= RAIN_THRESHOLD_MM else 0)
     if precip >= 10 or p >= 80:
-        return 65  # heavy rain
+        return 65
     if precip >= RAIN_THRESHOLD_MM or p >= 55:
-        return 61  # rain
+        return 61
     if p >= 35:
-        return 3   # overcast
+        return 3
     if p >= 20:
-        return 2   # partly cloudy
-    return 1       # mainly clear
+        return 2
+    return 1
 
 
 def _public(rec: dict) -> dict:
-    """Trim an internal record down to JSON-friendly fields for the UI."""
     return {
         "date": rec["date"].isoformat() if isinstance(rec["date"], dt.date) else rec["date"],
-        "tmax": round(rec["tmax"], 1),
-        "tmin": round(rec["tmin"], 1),
-        "tmean": round(rec["tmean"], 1),
-        "precip": round(rec["precip"], 1),
+        "tmax": round(rec["tmax"], 1), "tmin": round(rec["tmin"], 1),
+        "tmean": round(rec["tmean"], 1), "precip": round(rec["precip"], 1),
         "weather_code": rec.get("weather_code", 0),
     }
