@@ -55,7 +55,7 @@ Or manually:
 1. Create a free account at [render.com](https://render.com) (sign in with GitHub).
 2. **New → Web Service** → pick the `aura-weather-predictor` repo.
 3. Render auto-detects everything from `render.yaml`. Click **Deploy**.
-4. In ~2–3 minutes you get a public URL like `https://aura-weather.onrender.com`.
+4. In ~2–3 minutes you get a public URL like `https://aura-weather-predictor.onrender.com`.
 
 Note: the free tier sleeps after 15 min of inactivity, so the very first visit
 after a nap takes ~50s to wake up. Every visit after that is fast.

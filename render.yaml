@@ -2,7 +2,7 @@
 # See https://render.com/docs/blueprint-spec
 services:
   - type: web
-    name: aura-weather
+    name: aura-weather-predictor
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
