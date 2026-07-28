@@ -1,0 +1,49 @@
+name: Update weather data
+
+# Runs hourly to refresh the pre-computed forecasts. The website reads these
+# committed JSON files, so it never calls a weather API itself (nothing to
+# rate-limit). Public repo => unlimited free Action minutes.
+on:
+  schedule:
+    - cron: "0 * * * *"        # every hour, on the hour (UTC)
+  workflow_dispatch: {}         # lets you run it manually from the Actions tab
+  push:
+    branches: [main]
+    paths:
+      - "build_data.py"
+      - ".github/workflows/update-weather.yml"
+
+permissions:
+  contents: write               # allow the job to commit the refreshed data
+
+concurrency:
+  group: update-weather
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install numpy requests
+
+      - name: Generate forecasts
+        run: python build_data.py
+
+      - name: Commit refreshed data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/data
+          if git diff --cached --quiet; then
+            echo "No data changes."
+          else
+            git commit -m "chore: hourly weather data refresh"
+            git push
+          fi
