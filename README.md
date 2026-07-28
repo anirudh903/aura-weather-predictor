@@ -46,11 +46,15 @@ weather-predictor/
 
 ## Deploy as a website (Render, free)
 
-This repo is deploy-ready (`Procfile` + `render.yaml`).
+This repo is deploy-ready (`Procfile` + `render.yaml`). One-click:
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/anirudh903/aura-weather-predictor)
+
+Or manually:
 
 1. Create a free account at [render.com](https://render.com) (sign in with GitHub).
-2. **New → Web Service**, pick this repository.
-3. Render auto-detects the settings from `render.yaml`. Click **Deploy**.
+2. **New → Web Service** → pick the `aura-weather-predictor` repo.
+3. Render auto-detects everything from `render.yaml`. Click **Deploy**.
 4. In ~2–3 minutes you get a public URL like `https://aura-weather.onrender.com`.
 
 Note: the free tier sleeps after 15 min of inactivity, so the very first visit
